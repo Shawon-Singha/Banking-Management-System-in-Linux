@@ -1,3 +1,8 @@
+sudo apt update
+
+#install zenity  in linux
+sudo apt install zenity
+
 #!/bin/bash
 
 # GUI Bank Management System with zenity
