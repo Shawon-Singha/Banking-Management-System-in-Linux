@@ -1,0 +1,387 @@
+#!/bin/bash
+
+# GUI Bank Management System with zenity
+BANK_DB="bank_records.txt"
+PASSWORD_FILE="passwords.txt"
+TRANSACTION_HISTORY="transaction_history.txt"
+
+# File to track warnings
+WARNINGS_FILE="warnings.txt"
+
+# Function to center dialogs (set a fixed position)
+centered_zenity() {
+    # Set the fixed position of the zenity window (adjust as needed)
+    WINDOW_GEOMETRY="1200x900+100+100"  # WidthxHeight+X+Y
+    zenity "$@" --width=1200 --height=900
+}
+
+initialize_passwords() {
+    if [ ! -f "$PASSWORD_FILE" ]; then
+        admin_password=$(centered_zenity --password --title="Set Admin Password" --text="Enter Admin Password:")
+        user_password=$(centered_zenity --password --title="Set User Password" --text="Enter User Password:")
+        
+        if [ -n "$admin_password" ] && [ -n "$user_password" ]; then
+            echo "ADMIN_PASSWORD=$admin_password" > "$PASSWORD_FILE"
+            echo "USER_PASSWORD=$user_password" >> "$PASSWORD_FILE"
+            centered_zenity --info --text="Passwords set successfully!"
+        else
+            centered_zenity --error --text="Passwords cannot be empty. Exiting..."
+            exit 1
+        fi
+    fi
+    source "$PASSWORD_FILE"
+}
+
+login() {
+    mode=$(centered_zenity --list --title="Login" --radiolist --column="Select" --column="Mode" \
+        TRUE "Admin" FALSE "User")
+
+    if [ "$mode" == "Admin" ]; then
+        password=$(centered_zenity --password --title="Admin Login" --text="Enter Admin Password:")
+        if [ "$password" == "$ADMIN_PASSWORD" ]; then
+            ADMIN_MODE=1
+            centered_zenity --info --text="Admin Login Successful!"
+        else
+            centered_zenity --error --text="Incorrect Admin Password!"
+            exit 1
+        fi
+    elif [ "$mode" == "User" ]; then
+        acc_no=$(centered_zenity --entry --title="User Login" --text="Enter Your Account Number:")
+        account=$(grep "^$acc_no " "$BANK_DB")
+
+        if [ -z "$account" ]; then
+            centered_zenity --error --text="Account not found!"
+            exit 1
+        fi
+
+        acc_password=$(centered_zenity --password --title="User Login" --text="Enter Your Password:")
+        stored_password=$(echo "$account" | cut -d' ' -f4)
+
+        if [ "$acc_password" == "$stored_password" ]; then
+            ADMIN_MODE=0
+            centered_zenity --info --text="User Login Successful!"
+        else
+            centered_zenity --error --text="Incorrect User Password!"
+            exit 1
+        fi
+    else
+        centered_zenity --error --text="Invalid selection!"
+        exit 1
+    fi
+}
+
+create_account() {
+    if [ $ADMIN_MODE -eq 1 ]; then
+        acc_no=$(centered_zenity --entry --title="Create Account" --text="Enter Account Number:")
+        if grep -q "^$acc_no " "$BANK_DB"; then
+            centered_zenity --error --text="Account number $acc_no already exists!"
+            return
+        fi
+        
+        name=$(centered_zenity --entry --title="Create Account" --text="Enter Account Holder's Name:")
+        deposit=$(centered_zenity --entry --title="Create Account" --text="Enter Initial Deposit:")
+        acc_password=$(centered_zenity --password --title="Create Account" --text="Set Account Password:")
+        
+        echo "$acc_no $name $deposit $acc_password" >> "$BANK_DB"
+        echo "$acc_no Created account with initial deposit of $deposit" >> "$TRANSACTION_HISTORY"
+        centered_zenity --info --text="Account created successfully!"
+    else
+        centered_zenity --error --text="Access Denied! Only Admin can create accounts."
+    fi
+}
+
+view_account() {
+    acc_no=$(centered_zenity --entry --title="View Account" --text="Enter Account Number:")
+    account=$(grep "^$acc_no " "$BANK_DB")
+    
+    if [ -z "$account" ]; then
+        centered_zenity --error --text="Account not found!"
+        return
+    fi
+    
+    acc_password=$(centered_zenity --password --title="View Account" --text="Enter Account Password:")
+    stored_password=$(echo "$account" | cut -d' ' -f4)
+    
+    if [ "$acc_password" == "$stored_password" ]; then
+        details=$(echo "$account" | awk '{printf "Account Number: %s\nName: %s\nBalance: %s", $1, $2, $3}')
+        centered_zenity --info --title="Account Details" --text="$details"
+    else
+        centered_zenity --error --text="Incorrect password!"
+    fi
+}
+
+deposit_money() {
+    acc_no=$(centered_zenity --entry --title="Deposit Money" --text="Enter Account Number:")
+    acc_password=$(centered_zenity --password --title="Deposit Money" --text="Enter Account Password:")
+    account=$(grep "^$acc_no " "$BANK_DB")
+    
+    if [ -z "$account" ]; then
+        centered_zenity --error --text="Account not found!"
+        return
+    fi
+    
+    stored_password=$(echo "$account" | cut -d' ' -f4)
+    if [ "$acc_password" == "$stored_password" ]; then
+        deposit=$(centered_zenity --entry --title="Deposit Money" --text="Enter Deposit Amount:")
+        balance=$(echo "$account" | cut -d' ' -f3)
+        new_balance=$((balance + deposit))
+        sed -i "/^$acc_no /c\\$acc_no $(echo "$account" | cut -d' ' -f2) $new_balance $acc_password" "$BANK_DB"
+        echo "$acc_no Deposited $deposit" >> "$TRANSACTION_HISTORY"
+        centered_zenity --info --text="Deposit successful! New Balance: $new_balance"
+    else
+        centered_zenity --error --text="Incorrect password!"
+    fi
+}
+
+withdraw_money() {
+    acc_no=$(centered_zenity --entry --title="Withdraw Money" --text="Enter Account Number:")
+    acc_password=$(centered_zenity --password --title="Withdraw Money" --text="Enter Account Password:")
+    account=$(grep "^$acc_no " "$BANK_DB")
+    
+    if [ -z "$account" ]; then
+        centered_zenity --error --text="Account not found!"
+        return
+    fi
+
+    stored_password=$(echo "$account" | cut -d' ' -f4)
+    if [ "$acc_password" != "$stored_password" ]; then
+        centered_zenity --error --text="Incorrect password!"
+        return
+    fi
+
+    # Check if account is blocked
+    if echo "$account" | grep -q "BLOCKED"; then
+        centered_zenity --error --text="This account is blocked! Please contact the bank."
+        return
+    fi
+
+    balance=$(echo "$account" | cut -d' ' -f3)
+    withdraw_amount=$(centered_zenity --entry --title="Withdraw Money" --text="Enter Withdrawal Amount:")
+
+    if [ "$withdraw_amount" -gt "$balance" ]; then
+        # Handle warnings
+        warning_count=$(grep "^$acc_no " "$WARNINGS_FILE" | cut -d' ' -f2)
+        
+        if [ -z "$warning_count" ]; then
+            warning_count=0
+        fi
+
+        warning_count=$((warning_count + 1))
+
+        if [ "$warning_count" -ge 2 ]; then
+            # Block the account after second warning
+            sed -i "/^$acc_no /c\\$acc_no $(echo "$account" | cut -d' ' -f2) $balance BLOCKED" "$BANK_DB"
+            centered_zenity --error --text="This account is now BLOCKED due to repeated violations!"
+        else
+            # Update warnings
+            grep -v "^$acc_no " "$WARNINGS_FILE" > temp_warnings.txt
+            echo "$acc_no $warning_count" >> temp_warnings.txt
+            mv temp_warnings.txt "$WARNINGS_FILE"
+
+            centered_zenity --warning --text="Insufficient funds! Warning #$warning_count issued. Attempting again may result in account blocking."
+        fi
+        return
+    fi
+
+    # Proceed with withdrawal if amount is valid
+    new_balance=$((balance - withdraw_amount))
+    sed -i "/^$acc_no /c\\$acc_no $(echo "$account" | cut -d' ' -f2) $new_balance $stored_password" "$BANK_DB"
+    echo "$acc_no Withdrew $withdraw_amount" >> "$TRANSACTION_HISTORY"
+    centered_zenity --info --text="Withdrawal successful! New Balance: $new_balance"
+    
+    # Reset warnings after successful transaction
+    grep -v "^$acc_no " "$WARNINGS_FILE" > temp_warnings.txt
+    mv temp_warnings.txt "$WARNINGS_FILE"
+}
+
+
+view_all_accounts() {
+    if [ $ADMIN_MODE -eq 1 ]; then
+        if [ ! -s "$BANK_DB" ]; then
+            centered_zenity --info --text="No accounts found in the system."
+            return
+        fi
+
+        # Create a display-friendly format for all accounts
+        account_data=$(awk '{
+            status="ACTIVE"; 
+            if ($4 == "BLOCKED") {
+                status="BLOCKED";
+            }
+            printf "Account No: %s\nName: %s\nBalance: %s\nStatus: %s\n\n", $1, $2, $3, status
+        }' "$BANK_DB")
+        
+        centered_zenity --text-info --title="View All Accounts" --width=500 --height=400 --filename=<(echo "$account_data")
+    else
+        centered_zenity --error --text="Access Denied! Only Admin can view all accounts."
+    fi
+}
+
+
+
+view_transaction_history() {
+    if [ $ADMIN_MODE -eq 1 ]; then
+        # Admin can view all transactions
+        if [ ! -s "$TRANSACTION_HISTORY" ]; then
+            centered_zenity --info --text="No transactions found."
+        else
+            centered_zenity --text-info --title="Transaction History (Admin)" --width=600 --height=400 --filename="$TRANSACTION_HISTORY"
+        fi
+    else
+        # User can only view their own transaction history
+        acc_no=$(centered_zenity --entry --title="Transaction History" --text="Enter Your Account Number:")
+        acc_password=$(centered_zenity --password --title="Transaction History" --text="Enter Your Account Password:")
+
+        account=$(grep "^$acc_no " "$BANK_DB")
+        if [ -z "$account" ]; then
+            centered_zenity --error --text="Account not found!"
+        else
+            stored_password=$(echo "$account" | cut -d' ' -f4)
+            if [ "$acc_password" == "$stored_password" ]; then
+                # Display only transactions related to the given account
+                user_transactions=$(grep "^$acc_no" "$TRANSACTION_HISTORY")
+                if [ -z "$user_transactions" ]; then
+                    centered_zenity --info --text="No transactions found for Account Number $acc_no."
+                else
+                    centered_zenity --text-info --title="Transaction History (User)" --width=600 --height=400 --filename=<(echo "$user_transactions")
+                fi
+            else
+                centered_zenity --error --text="Incorrect password!"
+            fi
+        fi
+    fi
+}
+
+
+block_account() {
+    if [ $ADMIN_MODE -eq 1 ]; then
+        acc_no=$(centered_zenity --entry --title="Block/Unblock Account" --text="Enter Account Number:")
+        account=$(grep "^$acc_no " "$BANK_DB")
+
+        if [ -z "$account" ]; then
+            centered_zenity --error --text="Account not found!"
+            return
+        fi
+
+        # Check if the account is blocked
+        if echo "$account" | grep -q "BLOCKED"; then
+            # Prompt admin to unblock the account
+            unblock_choice=$(centered_zenity --question --title="Unblock Account" --text="Account $acc_no is BLOCKED. Do you want to unblock it?" --ok-label="Yes" --cancel-label="No")
+            if [ $? -eq 0 ]; then
+                # Unblock the account (reset status to ACTIVE by restoring password)
+                original_password=$(grep -w "^$acc_no " "$WARNINGS_FILE" | cut -d' ' -f3)
+                sed -i "/^$acc_no /c\\$acc_no $(echo "$account" | cut -d' ' -f2) $(echo "$account" | cut -d' ' -f3) $original_password" "$BANK_DB"
+
+                # Reset warnings
+                grep -v "^$acc_no " "$WARNINGS_FILE" > temp_warnings.txt
+                mv temp_warnings.txt "$WARNINGS_FILE"
+                centered_zenity --info --text="Account $acc_no has been unblocked and warnings reset."
+            fi
+        else
+            # Block the account
+            sed -i "/^$acc_no /c\\$acc_no $(echo "$account" | cut -d' ' -f2) $(echo "$account" | cut -d' ' -f3) BLOCKED" "$BANK_DB"
+            centered_zenity --info --text="Account $acc_no is now blocked."
+        fi
+    else
+        centered_zenity --error --text="Access Denied! Only Admin can block or unblock accounts."
+    fi
+}
+
+
+
+transfer_money() {
+    # Sender's account details from the login session
+    sender_account=$1
+    sender_password=$2
+
+    # Fetch sender's account data
+    sender_account_data=$(grep "^$sender_account " "$BANK_DB")
+    sender_balance=$(echo "$sender_account_data" | cut -d' ' -f3)
+
+    # Validate sender account data
+    if [ -z "$sender_account_data" ]; then
+        centered_zenity --error --text="Sender account not found!"
+        return
+    fi
+
+    # Prompt for recipient account number
+    recipient_account=$(centered_zenity --entry --title="Transfer Money" --text="Enter Recipient's Account Number:")
+
+    # Ensure the recipient is not the sender
+    if [ "$recipient_account" == "$sender_account" ]; then
+        centered_zenity --error --text="You cannot transfer money to your own account!"
+        return
+    fi
+
+    # Fetch recipient account data
+    recipient_account_data=$(grep "^$recipient_account " "$BANK_DB")
+
+    # Validate recipient account
+    if [ -z "$recipient_account_data" ]; then
+        centered_zenity --error --text="Recipient account not found!"
+        return
+    fi
+
+    # Prompt for transfer amount
+    transfer_amount=$(centered_zenity --entry --title="Transfer Money" --text="Enter Amount to Transfer:" --entry-text "0")
+
+    # Ensure the transfer amount is a valid number
+    if ! [[ "$transfer_amount" =~ ^[0-9]+$ ]]; then
+        centered_zenity --error --text="Transfer amount must be a valid number!"
+        return
+    fi
+
+    # Convert transfer amount to an integer
+    transfer_amount=$((transfer_amount))
+
+    # Validate transfer amount
+    if (( transfer_amount <= 0 )); then
+        centered_zenity --error --text="Transfer amount must be greater than zero!"
+        return
+    elif (( transfer_amount > sender_balance )); then
+        centered_zenity --error --text="Insufficient funds! Your current balance is $sender_balance."
+        return
+    fi
+
+    # Fetch recipient balance
+    recipient_balance=$(echo "$recipient_account_data" | cut -d' ' -f3)
+
+    # Perform the transfer
+    new_sender_balance=$((sender_balance - transfer_amount))
+    new_recipient_balance=$((recipient_balance + transfer_amount))
+
+    # Update sender's and recipient's account data in the database
+    sed -i "/^$sender_account /c\\$sender_account $(echo "$sender_account_data" | cut -d' ' -f2) $new_sender_balance $sender_password" "$BANK_DB"
+    sed -i "/^$recipient_account /c\\$recipient_account $(echo "$recipient_account_data" | cut -d' ' -f2) $new_recipient_balance $(echo "$recipient_account_data" | cut -d' ' -f4)" "$BANK_DB"
+
+    # Log the transaction
+    echo "$sender_account Transferred $transfer_amount to $recipient_account" >> "$TRANSACTION_HISTORY"
+    centered_zenity --info --text="Transfer Successful! Your new balance is $new_sender_balance."
+}
+
+
+initialize_passwords
+login
+while true; do
+    if [ $ADMIN_MODE -eq 1 ]; then
+        action=$(centered_zenity --list --title="Admin Menu" --radiolist --column="Select" --column="Option" \
+            TRUE "Create Account" FALSE "View All Accounts" FALSE "View Transaction History" FALSE "Block Account" \
+            FALSE "Logout")
+    else
+        action=$(centered_zenity --list --title="User Menu" --radiolist --column="Select" --column="Option" \
+            TRUE "View Account" FALSE "Deposit Money" FALSE "Withdraw Money" FALSE "Transfer Money" FALSE "View Transaction History" FALSE "Logout")
+    fi
+
+    case "$action" in
+        "Create Account") create_account ;;
+        "View Account") view_account ;;
+        "Deposit Money") deposit_money ;;
+        "Withdraw Money") withdraw_money ;;
+        "Transfer Money") transfer_money "$acc_no" "$acc_password" ;;
+        "View All Accounts") view_all_accounts ;;
+        "View Transaction History") view_transaction_history ;;
+        "Block Account") block_account ;;
+        "Logout") break ;;
+        *) centered_zenity --error --text="Invalid option selected!" ;;
+    esac
+done
